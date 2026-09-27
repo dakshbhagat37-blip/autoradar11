@@ -1,4 +1,5 @@
 import type { Lead, LeadInput, ServiceTrack } from "@/lib/leads/types";
+import type { QualifiedLead } from "@/lib/qualification/qualified-lead";
 
 export type DiscoveryRequest = {
   text?: string;
@@ -16,6 +17,7 @@ export type DiscoveryResponse = {
   provider: string;
   discovered: number;
   leads: Lead[];
+  qualifiedLeads?: QualifiedLead[];
   nextCursor?: string | null;
 };
 

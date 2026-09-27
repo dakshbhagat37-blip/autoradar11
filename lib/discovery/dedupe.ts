@@ -1,74 +1,184 @@
-import { normalizeWebsite } from "@/lib/leads/normalize";
-import type { Lead } from "@/lib/leads/types";
+type LeadLike = {
+  name?: string | null;
+  companyName?: string | null;
+  address?: string | null;
+  phone?: string | null;
+  website?: string | null;
+  email?: string | null;
+  linkedin?: string | null;
+  instagram?: string | null;
+  source?: string | null;
+  provider?: string | null;
+  evidence?: string[] | null;
+  [key: string]: unknown;
+};
 
-function compactText(value: string): string {
-  return value.trim().toLowerCase().replace(/\s+/g, " ");
+const DIRECTORY_DOMAINS = new Set([
+  "webmd.com",
+  "yelp.com",
+  "yellowpages.com",
+  "justdial.com",
+  "sulekha.com",
+  "practo.com",
+  "healthgrades.com",
+  "zocdoc.com",
+  "facebook.com",
+  "instagram.com",
+  "linkedin.com",
+  "mapquest.com",
+  "foursquare.com",
+  "tripadvisor.com",
+  "indiamart.com",
+  "tradeindia.com",
+]);
+
+function normalize(value?: string | null): string {
+  return (value ?? "")
+    .toLowerCase()
+    .trim()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/\/.*$/, "");
 }
 
-function comparisonName(name: string): string {
-  return compactText(name);
+function getDomain(website?: string | null): string {
+  return normalize(website);
 }
 
-function comparisonCity(city: string | null | undefined): string | null {
-  if (!city) return null;
-  const normalized = compactText(city);
-  return normalized === "" ? null : normalized;
-}
+function isDirectoryWebsite(website?: string | null): boolean {
+  const domain = getDomain(website);
 
-function comparisonDomain(website: string | null | undefined): string | null {
-  const normalized = normalizeWebsite(website);
-  if (!normalized) return null;
-
-  try {
-    const hasScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(normalized);
-    const url = new URL(hasScheme ? normalized : `https://${normalized}`);
-    const host = url.hostname.toLowerCase();
-    return host === "" ? null : host;
-  } catch {
-    const fallback = compactText(normalized);
-    return fallback === "" ? null : fallback;
+  if (!domain) {
+    return false;
   }
+
+  for (const blocked of DIRECTORY_DOMAINS) {
+    if (domain === blocked || domain.endsWith(`.${blocked}`)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
-/**
- * Conservative company dedupe. Same domain always merges.
- * Same name + city merges. Same name with no location on either side merges.
- * Similar-but-different names are never merged.
- */
-export function dedupeLeads(leads: Lead[]): Lead[] {
-  const seenDomains = new Set<string>();
-  const seenNameCity = new Set<string>();
-  const seenNameWithoutLocation = new Set<string>();
-  const unique: Lead[] = [];
+function cleanText(value?: string | null): string {
+  return (value ?? "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-  for (const lead of leads) {
-    const domain = comparisonDomain(lead.website);
-    if (domain && seenDomains.has(domain)) {
+function getLeadName(lead: LeadLike): string {
+  return lead.name?.trim() || lead.companyName?.trim() || "";
+}
+
+function getIdentityKey(lead: LeadLike): string {
+  const website = getDomain(lead.website);
+
+  // Official website is the strongest identity signal.
+  if (website && !isDirectoryWebsite(lead.website)) {
+    return `website:${website}`;
+  }
+
+  const name = cleanText(getLeadName(lead));
+  const address = cleanText(lead.address);
+
+  if (!name && !address) {
+    return "";
+  }
+
+  return `name:${name}|address:${address}`;
+}
+
+function completenessScore(lead: LeadLike): number {
+  const fields = [
+    getLeadName(lead),
+    lead.address,
+    lead.phone,
+    lead.website,
+    lead.email,
+    lead.linkedin,
+    lead.instagram,
+    lead.source,
+    lead.provider,
+  ];
+
+  return fields.reduce((score, value) => {
+    return score + (typeof value === "string" && value.trim() ? 1 : 0);
+  }, 0);
+}
+
+export function filterDirectoryCandidates<T extends LeadLike>(
+  candidates: T[],
+): T[] {
+  return candidates.filter((candidate) => {
+    if (!getLeadName(candidate)) {
+      return false;
+    }
+
+    if (isDirectoryWebsite(candidate.website)) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+export function dedupeCandidates<T extends LeadLike>(
+  candidates: T[],
+): T[] {
+  const seen = new Map<string, T>();
+
+  for (const candidate of candidates) {
+    const key = getIdentityKey(candidate);
+
+    if (!key) {
       continue;
     }
 
-    const name = comparisonName(lead.companyName);
-    const city = comparisonCity(lead.city);
+    const existing = seen.get(key);
 
-    if (city) {
-      const nameCityKey = `${name}|${city}`;
-      if (seenNameCity.has(nameCityKey)) {
-        continue;
-      }
-      seenNameCity.add(nameCityKey);
+    if (!existing) {
+      seen.set(key, candidate);
+      continue;
+    }
+
+    const existingScore = completenessScore(existing);
+    const candidateScore = completenessScore(candidate);
+
+    if (candidateScore > existingScore) {
+      seen.set(key, {
+        ...existing,
+        ...candidate,
+      });
     } else {
-      if (seenNameWithoutLocation.has(name)) {
-        continue;
-      }
-      seenNameWithoutLocation.add(name);
+      seen.set(key, {
+        ...candidate,
+        ...existing,
+      });
     }
-
-    if (domain) {
-      seenDomains.add(domain);
-    }
-
-    unique.push(lead);
   }
 
-  return unique;
+  return Array.from(seen.values());
+}
+
+/**
+ * Backwards-compatible API used by pipeline.ts.
+ *
+ * Generic return type guarantees:
+ * Lead[] in -> Lead[] out
+ */
+export function dedupeLeads<T extends LeadLike>(
+  leads: T[],
+): T[] {
+  const filtered = filterDirectoryCandidates(leads);
+
+  return dedupeCandidates(filtered);
+}
+
+export function processCandidates<T extends LeadLike>(
+  candidates: T[],
+): T[] {
+  return dedupeLeads(candidates);
 }
